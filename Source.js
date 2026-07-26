@@ -17,6 +17,25 @@ const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
 const DOWNSTREAM_GRAIN_BYTES = 32 * 1024;
 const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
 const DOWNSTREAM_GRAIN_SILENT_MS = 1;
+const DNS_CACHE_MAX_ENTRIES = 2048;
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder();
+const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
+function safeDecodeURI(value) {
+	try {
+		return decodeURIComponent(value);
+	} catch (e) {
+		return value;
+	}
+}
+async function readJsonBody(request) {
+	try {
+		const body = await request.json();
+		return body && typeof body === "object" ? body : {};
+	} catch (e) {
+		return {};
+	}
+}
 async function fetchWithFallback(path, options = {}) {
 	const githubUrl = `https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/${path}`;
 	const staticUrl = `https://zeus-files.surge.sh/${path}`;
@@ -165,12 +184,13 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 			const s = await connectProxy(oldProxy, "ip-api.com", 80, payload);
 			const reader = s.readable.getReader();
 			let resStr = "";
+			const dec = new TextDecoder();
 			const timeoutId = setTimeout(() => { try { s.close(); } catch(e){} }, 2000);
 			try {
 				while (true) {
 					const res = await reader.read();
 					if (res.done || !res.value) break;
-					resStr += new TextDecoder().decode(res.value, { stream: true });
+					resStr += dec.decode(res.value, { stream: true });
 					if (resStr.includes("countryCode")) break;
 				}
 			} finally {
@@ -248,18 +268,20 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 					try {
 						newProxy = await Promise.any(testBatch.map(p => {
 							return new Promise(async (resolve, reject) => {
-								const timeoutId = setTimeout(() => reject(new Error('timeout')), 3000); 
+								let sock = null;
+								const timeoutId = setTimeout(() => { try { sock && sock.close(); } catch (e) {} reject(new Error('timeout')); }, 3000); 
 								try {
-									const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-									const s = await connectProxy(p, "1.1.1.1", 80, payload);
-									const reader = s.readable.getReader();
+									const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+									sock = await connectProxy(p, "1.1.1.1", 80, payload);
+									const reader = sock.readable.getReader();
 									const res = await reader.read();
-									s.close();
 									clearTimeout(timeoutId);
+									try { sock.close(); } catch (e) {}
 									if (res.done || !res.value) reject(new Error("empty"));
 									else resolve(p);
 								} catch (e) {
 									clearTimeout(timeoutId);
+									try { sock && sock.close(); } catch (err) {}
 									reject(e);
 								}
 							});
@@ -295,31 +317,37 @@ export default {
 		if (!env.DB) {
 			return new Response("Database binding 'DB' is missing in Cloudflare Workers settings.", { status: 500 });
 		}
-		await DbService.ensureSchema(env.DB);
-		trackRequest(env, ctx);
-		if (schemaEnsured) {
-			ctx.waitUntil(checkAutoResets(env, ctx));
-			ctx.waitUntil(checkAutoRotates(env, ctx));
+		try {
+			try {
+				await DbService.ensureSchema(env.DB);
+			} catch (e) {}
+			trackRequest(env, ctx);
+			if (schemaEnsured) {
+				ctx.waitUntil(checkAutoResets(env, ctx));
+				ctx.waitUntil(checkAutoRotates(env, ctx));
+			}
+			const url = new URL(request.url);
+			if (Router.isWebSocketUpgrade(request)) {
+				return await Router.handleWebSocket(request, env, ctx);
+			}
+			if (Router.isSubscriptionPath(url.pathname)) {
+				return await Router.handleSubscription(url, env);
+			}
+			if (url.pathname.startsWith("/api/")) {
+				return await Router.handleApi(request, url, env, ctx);
+			}
+			if (url.pathname === "/panel" || url.pathname === "/login") {
+				return await Router.handlePanel(request, env);
+			}
+			if (url.pathname.startsWith("/status/")) {
+				return await Router.handleUserStatus(url, env);
+			}
+			return new Response(HTML_TEMPLATES.nginx, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		} catch (err) {
+			return new Response("Internal Server Error", { status: 500 });
 		}
-		const url = new URL(request.url);
-		if (Router.isWebSocketUpgrade(request)) {
-			return await Router.handleWebSocket(request, env, ctx);
-		}
-		if (Router.isSubscriptionPath(url.pathname)) {
-			return await Router.handleSubscription(url, env);
-		}
-		if (url.pathname.startsWith("/api/")) {
-			return await Router.handleApi(request, url, env, ctx);
-		}
-		if (url.pathname === "/panel" || url.pathname === "/login") {
-			return await Router.handlePanel(request, env);
-		}
-		if (url.pathname.startsWith("/status/")) {
-			return await Router.handleUserStatus(url, env);
-		}
-		return new Response(HTML_TEMPLATES.nginx, {
-			headers: { "Content-Type": "text/html; charset=utf-8" },
-		});
 	},
 };
 const Router = {
@@ -340,7 +368,7 @@ const Router = {
 	async handleSubscription(url, env) {
 		const isSubPath = url.pathname.startsWith("/sub/");
 		const offset = isSubPath ? 5 : 6;
-		let subUser = decodeURIComponent(url.pathname.slice(offset));
+		let subUser = safeDecodeURI(url.pathname.slice(offset));
 		const host = url.hostname;
 		try {
 			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(subUser, subUser).first();
@@ -378,7 +406,7 @@ const Router = {
 		});
 	},
 	async handleUserStatus(url, env) {
-		const username = decodeURIComponent(url.pathname.slice(8));
+		const username = safeDecodeURI(url.pathname.slice(8));
 		if (!username) {
 			return new Response("Username is required", { status: 400 });
 		}
@@ -424,7 +452,7 @@ const Router = {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const { password } = await request.json();
+			const { password } = await readJsonBody(request);
 			if (!password || password.length < 4) {
 				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
 					status: 400,
@@ -443,6 +471,11 @@ const Router = {
 		if (url.pathname === "/api/login" && request.method === "POST") {
 			const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
 			const now = Date.now();
+			if (LOGIN_ATTEMPTS.size > 256) {
+				for (const [ip, rec] of LOGIN_ATTEMPTS) {
+					if (now - rec.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
+				}
+			}
 			const attemptRecord = LOGIN_ATTEMPTS.get(clientIP) || { count: 0, lastAttempt: 0 };
 			if (attemptRecord.count >= 5 && (now - attemptRecord.lastAttempt) < 900000) {
 				const remaining = Math.ceil((900000 - (now - attemptRecord.lastAttempt)) / 60000);
@@ -451,7 +484,7 @@ const Router = {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const { password } = await request.json();
+			const { password } = await readJsonBody(request);
 			const hashedInput = await DbService.sha256(password);
 			const storedHash = await DbService.getPanelPassword(env.DB);
 			let isValid = false;
@@ -491,7 +524,7 @@ const Router = {
 			});
 		}
 		if (url.pathname === "/api/recover" && request.method === "POST") {
-			const { api_token } = await request.json();
+			const { api_token } = await readJsonBody(request);
 			if (!api_token) {
 				return new Response(JSON.stringify({ error: "Token is required" }), {
 					status: 400,
@@ -569,6 +602,39 @@ const Router = {
 				headers: { "Content-Type": "application/json; charset=utf-8" },
 			});
 		}
+		if (url.pathname === "/api/auto-update-setup" && request.method === "POST") {
+			const body = await readJsonBody(request);
+			if (body.action === "check") {
+				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
+				const hasToken = !!env.CF_API_TOKEN || !!(dbTokenRow && dbTokenRow.value);
+				const autoUpdateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'auto_update'").first();
+				const isAutoUpdateEnabled = autoUpdateRow ? autoUpdateRow.value === '1' : false;
+				return new Response(JSON.stringify({ has_token: hasToken, auto_update: isAutoUpdateEnabled }), { headers: { "Content-Type": "application/json" } });
+			}
+			if (body.action === "enable") {
+				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
+				let token = body.token || env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null);
+				if (!token) return new Response(JSON.stringify({ error: "TOKEN_MISSING" }), { status: 400, headers: { "Content-Type": "application/json" } });
+				try {
+					const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+						headers: { Authorization: "Bearer " + token },
+					});
+					const cfData = await cfRes.json();
+					if (!cfRes.ok || !cfData.success) {
+						return new Response(JSON.stringify({ error: "INVALID_TOKEN" }), { status: 400, headers: { "Content-Type": "application/json" } });
+					}
+					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_token', ?)").bind(token).run();
+					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '1')").run();
+					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+				} catch(e) {
+					return new Response(JSON.stringify({ error: "خطا در بررسی توکن با کلودفلر" }), { status: 500, headers: { "Content-Type": "application/json" } });
+				}
+			}
+			if (body.action === "disable") {
+				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '0')").run();
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+			}
+		}
 		if (url.pathname === "/api/restart-core" && request.method === "POST") {
 			try {
 				GLOBAL_TRAFFIC_CACHE.clear();
@@ -585,7 +651,8 @@ const Router = {
 		}
 		if (url.pathname === "/api/update-panel" && request.method === "POST") {
 			const body = await request.json().catch(() => ({}));
-			let currentToken = env.CF_API_TOKEN || body.cf_token || null;
+			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
+			let currentToken = env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null) || body.cf_token || null;
 			let currentAccountId = env.CF_ACCOUNT_ID;
 			if (!currentToken) {
 				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
@@ -602,7 +669,7 @@ const Router = {
 					if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
 					currentAccountId = accData.result[0].id;
 				}
-				const githubRes = await fetch("https://zeus-files.surge.sh/panel-source?t=" + Date.now(), {
+				const githubRes = await fetchWithFallback("zeus.obfuscated.js?t=" + Date.now(), {
 					headers: {
 						"User-Agent": "Mozilla/5.0",
 						"Cache-Control": "no-cache"
@@ -661,7 +728,7 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/change-password" && request.method === "POST") {
-			const { current_password, new_password } = await request.json();
+			const { current_password, new_password } = await readJsonBody(request);
 			if (!current_password || !new_password) {
 				return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
 					status: 400,
@@ -699,7 +766,7 @@ const Router = {
 					const settingsObj = {};
 					if (results) {
 						results.forEach((r) => {
-							settingsObj[r.key] = r.value;
+							if (r.key !== 'cf_token' && r.key !== 'panel_password') settingsObj[r.key] = r.value;
 						});
 					}
 					return new Response(JSON.stringify(settingsObj), { headers: { "Content-Type": "application/json" } });
@@ -708,7 +775,7 @@ const Router = {
 				}
 			}
 			if (request.method === "POST") {
-				const body = await request.json();
+				const body = await readJsonBody(request);
 				if (body.settings && typeof body.settings === "object") {
 					for (const [k, v] of Object.entries(body.settings)) {
 						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
@@ -719,7 +786,7 @@ const Router = {
 		}
 		if (url.pathname === "/api/proxy-ip") {
 			if (request.method === "POST") {
-				const { proxy_ip, iata, socks5 } = await request.json();
+				const { proxy_ip, iata, socks5 } = await readJsonBody(request);
 				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
 				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
 				if (socks5 !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('socks5', ?)").bind(socks5).run();
@@ -740,7 +807,7 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/test-proxy" && request.method === "POST") {
-			const { proxy } = await request.json();
+			const { proxy } = await readJsonBody(request);
 			if (!proxy) return new Response(JSON.stringify({ error: "پـروکـسـی وارد نشده است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			try {
 				let ip = "";
@@ -765,11 +832,12 @@ const Router = {
 				const s = await connectProxy(proxy, "ip-api.com", 80, payload);
 				const reader = s.readable.getReader();
 				let resStr = "";
+				const dec = new TextDecoder();
 				try {
 					while (true) {
 						const res = await reader.read();
 						if (res.done || !res.value) break;
-						resStr += new TextDecoder().decode(res.value, { stream: true });
+						resStr += dec.decode(res.value, { stream: true });
 						if (resStr.includes("countryCode")) break;
 					}
 				} finally {
@@ -804,9 +872,12 @@ const Router = {
 			const pathParts = url.pathname.split("/");
 			const isUserAction = pathParts.length > 3;
 			if (isUserAction) {
-				const username = decodeURIComponent(pathParts.pop());
+				const username = safeDecodeURI(pathParts.pop());
 				if (request.method === "PUT") {
-					const body = await request.json();
+					const body = await readJsonBody(request);
+					if (Object.keys(body).length === 0) {
+						return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { "Content-Type": "application/json" } });
+					}
 					if (body.toggle_only !== undefined) {
 						await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
@@ -929,7 +1000,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = await request.json();
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = await readJsonBody(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -1110,7 +1181,7 @@ const SubscriptionService = {
 			.map((p) => p.trim())
 			.filter((p) => p.length > 0);
 		const fp = user.fingerprint || "chrome";
-		const dynPath = encodeURIComponent("/stream/PANEL_ZEUS/" + (user.uuid ? user.uuid.split("-")[4] : "default"));
+		const dynPath = encodeURIComponent("/stream/PANEL_ZEUS/" + ((user.uuid || "").split("-")[4] || "default"));
 		const links = [];
 		const m1 = decodeURIComponent("%E2%9A%A0%EF%B8%8F%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%E2%9A%A0%EF%B8%8F");
 		const m2 = decodeURIComponent("%F0%9F%9A%80%40PANEL_ZEUS%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%F0%9F%9A%80");
@@ -1135,7 +1206,7 @@ const SubscriptionService = {
 		}
 		const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
 		links.push("vl" + "e" + "ss://" + user.uuid + "@" + host + ":80?path=" + dynPath + "&security=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(infoRemark));
-		const rawPath = "/stream/PANEL_ZEUS/" + (user.uuid ? user.uuid.split("-")[4] : "default");
+		const rawPath = "/stream/PANEL_ZEUS/" + ((user.uuid || "").split("-")[4] || "default");
 		let proxyList = [];
 		try {
 			if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
@@ -1159,12 +1230,13 @@ const SubscriptionService = {
 					const s = await connectProxy(proxyStr, "ip-api.com", 80, payload);
 					const reader = s.readable.getReader();
 					let resStr = "";
+					const dec = new TextDecoder();
 					const timeoutId = setTimeout(() => { try { s.close(); } catch(e){} }, 2000);
 					try {
 						while (true) {
 							const res = await reader.read();
 							if (res.done || !res.value) break;
-							resStr += new TextDecoder().decode(res.value, { stream: true });
+							resStr += dec.decode(res.value, { stream: true });
 							if (resStr.includes("countryCode")) break;
 						}
 					} finally {
@@ -1208,7 +1280,7 @@ const SubscriptionService = {
 			const currentDynPath = encodeURIComponent(rawPath + ((proxyList[0] !== null && proxyList[0] !== "") ? `?loc=${locIdx}` : ""));
 			ips.forEach((ip) => {
 				ports.forEach((portStr) => {
-					const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
+					const isTlsPort = TLS_PORTS.has(portStr);
 					const tlsVal = isTlsPort ? "tls" : "none";
 					const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
 					const remark = "ZEUS | " + flagEmoji + " | " + user.username;
@@ -1385,7 +1457,6 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				try {
 					const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
 					if (user) {
-						console.log(`[setOffline Task] DB active_ips for ${uname}: ${user.active_ips}`);
 						let activeIps = JSON.parse(user.active_ips || "{}");
 						if (activeIps[clientIP]) {
 							if (typeof activeIps[clientIP] === "object") {
@@ -1397,9 +1468,6 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 								delete activeIps[clientIP];
 							}
 							await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), validUUID).run();
-							console.log(`[setOffline Task] Updated active_ips in DB to: ${JSON.stringify(activeIps)}`);
-						} else {
-							console.log(`[setOffline Task] IP ${clientIP} not found in user's active_ips`);
 						}
 					}
 				} catch (e) {
@@ -1572,7 +1640,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	};
 	const processWsMessage = async (chunk) => {
 		const bytes = chunk.byteLength || 0;
-		await addBytes(bytes);
+		addBytes(bytes);
 		if (isDnsQuery) {
 			await forwardvIeesUDP(chunk, serverSock, null, addBytes, targetDns);
 			return;
@@ -1599,6 +1667,9 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 				requiredLen += chunkBuffer[18 + optLen + 4];
 			} else if (addrType === 3) {
 				requiredLen += 16;
+			} else {
+				serverSock.close();
+				return;
 			}
 			if (chunkBuffer.byteLength < requiredLen) return;
 			if (isHeaderParsing) return;
@@ -1618,7 +1689,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 			}
 			if (request) {
 				const reqUrl = new URL(request.url);
-				const expectedPath = "/stream/PANEL_ZEUS/" + (user.uuid ? user.uuid.split("-")[4] : "default");
+				const expectedPath = "/stream/PANEL_ZEUS/" + ((user.uuid || "").split("-")[4] || "default");
 				if (reqUrl.pathname !== expectedPath) {
 					serverSock.close();
 					return;
@@ -1731,7 +1802,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
 				} else if (addrType === 2) {
 					const domainLen = chunkBuffer[offset++];
-					addr = new TextDecoder().decode(chunkBuffer.slice(offset, offset + domainLen));
+					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
 					offset += domainLen;
 				} else if (addrType === 3) {
 					const v6 = [];
@@ -1765,7 +1836,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 					}
 					return;
 				}
-				if (port === 25 || port === 22 || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|fd[0-9a-f]{2}:|fe80:)/i.test(addr)) {
+				if (port === 25 || port === 22 || /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i.test(addr)) {
 					serverSock.close();
 					return;
 				}
@@ -1793,9 +1864,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 							}
 						remoteConnWrapper.socket = s;
 						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-						connectStreams(s, serverSock, respHeader, null, (b) => {
-							addBytes(b);
-						});
+						connectStreams(s, serverSock, respHeader, null, addBytes);
 					})();
 					remoteConnWrapper.connectingPromise = task;
 					try {
@@ -1817,6 +1886,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 		if (wsFailed) return;
 		wsFailed = true;
 		wsStopped = true;
+		clearTimeout(heartbeat);
 		wsQueueBytes = 0;
 		wsQueueItems = 0;
 		upstreamQueue.clear();
@@ -1829,6 +1899,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null) {
 	};
 	serverSock.addEventListener("message", (event) => {
 		if (wsStopped || wsFailed) return;
+		if (typeof event.data === "string") return;
 		const size = event.data.byteLength || 0;
 		const nextBytes = wsQueueBytes + size;
 		const nextItems = wsQueueItems + 1;
@@ -1906,8 +1977,19 @@ function convertToUint8Array(data) {
 	return new Uint8Array(data || 0);
 }
 function concatBytes(...chunkList) {
+	if (chunkList.length === 2) {
+		const a = convertToUint8Array(chunkList[0]);
+		const b = convertToUint8Array(chunkList[1]);
+		if (!a.byteLength) return b;
+		if (!b.byteLength) return a;
+		const merged = new Uint8Array(a.byteLength + b.byteLength);
+		merged.set(a, 0);
+		merged.set(b, a.byteLength);
+		return merged;
+	}
 	const chunks = chunkList.map(convertToUint8Array);
-	const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+	let total = 0;
+	for (const c of chunks) total += c.byteLength;
 	const result = new Uint8Array(total);
 	let offset = 0;
 	for (const c of chunks) {
@@ -1937,7 +2019,7 @@ async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
 			const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
 			const bufs = [];
 			for (const label of parts) {
-				const enc = new TextEncoder().encode(label);
+				const enc = TEXT_ENCODER.encode(label);
 				bufs.push(new Uint8Array([enc.length]), enc);
 			}
 			bufs.push(new Uint8Array([0]));
@@ -1983,7 +2065,7 @@ async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
 					jumped = true;
 					continue;
 				}
-				labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
+				labels.push(TEXT_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
 				p += len + 1;
 			}
 			if (endPos === -1) endPos = p + 1;
@@ -2020,6 +2102,10 @@ async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
 					.join("");
 			}
 			answers.push({ name, type, TTL: ttl, data });
+		}
+		if (DNS_CACHE.size >= DNS_CACHE_MAX_ENTRIES) {
+			const oldestKey = DNS_CACHE.keys().next().value;
+			if (oldestKey !== undefined) DNS_CACHE.delete(oldestKey);
 		}
 		DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
 		return answers;
@@ -2210,7 +2296,7 @@ function createDownstreamSender(webSocket, headerData = null) {
 	let currentPacketCap = 32 * 1024;
 	const tailBytes = 512;
 	let header = headerData;
-	let pendingBuffer = new Uint8Array(MAX_CAP);
+	let pendingBuffer = null;
 	let pendingBytes = 0;
 	let flushPromise = null;
 	let microtaskQueued = false;
@@ -2269,6 +2355,7 @@ function createDownstreamSender(webSocket, headerData = null) {
 					continue;
 				}
 				const copyBytes = Math.min(currentPacketCap - pendingBytes, totalBytes - offset);
+				if (!pendingBuffer) pendingBuffer = new Uint8Array(MAX_CAP);
 				pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
 				pendingBytes += copyBytes;
 				offset += copyBytes;
@@ -2312,7 +2399,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 	try {
 		if (!useBYOB) {
 			while (true) {
-				await waitForBackpressure(webSocket);
+				if (webSocket.bufferedAmount > 512 * 1024) await waitForBackpressure(webSocket);
 				const { done, value } = await reader.read();
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
@@ -2323,7 +2410,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 		} else {
 			let readBuffer = new ArrayBuffer(BYOB_LIMIT);
 			while (true) {
-				await waitForBackpressure(webSocket);
+				if (webSocket.bufferedAmount > 512 * 1024) await waitForBackpressure(webSocket);
 				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
@@ -2364,8 +2451,11 @@ async function connectDirect(address, port, initialData = null, targetDoh = "htt
 }
 async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
     const requestData = convertToUint8Array(udpChunk);
+    let tcpSocket = null;
+    const abortCtl = new AbortController();
+    const timeoutId = setTimeout(() => { try { abortCtl.abort(); } catch (e) {} }, 10000);
     try {
-        const tcpSocket = connect({ hostname: dnsServer, port: 53 });
+        tcpSocket = connect({ hostname: dnsServer, port: 53 });
         let vIeesHeader = respHeader;
         const writer = tcpSocket.writable.getWriter();
         await writer.write(requestData);
@@ -2387,8 +2477,13 @@ async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServ
                     }
                 },
             }),
+            { signal: abortCtl.signal },
         );
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+        clearTimeout(timeoutId);
+        try { if (tcpSocket) tcpSocket.close(); } catch (e) {}
+    }
 }
 function extractUUIDFromvIees(data) {
 	if (data.byteLength < 17) return null;
@@ -2622,10 +2717,11 @@ async function connectHttp(proxyStr, destAddr, destPort, initialData) {
 		req += "\r\n";
 		await writer.write(new TextEncoder().encode(req));
 		let resStr = "";
+		const dec = new TextDecoder();
 		while (true) {
 			const res = await reader.read();
 			if (res.done || !res.value) throw new Error("proxy_closed");
-			resStr += new TextDecoder().decode(res.value, { stream: true });
+			resStr += dec.decode(res.value, { stream: true });
 			if (resStr.includes("\r\n\r\n")) {
 				const match = resStr.match(/^HTTP\/\d\.\d\s+(\d+)/);
 				if (match && match[1] === "200") {
@@ -3709,6 +3805,18 @@ const HTML_TEMPLATES = {
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                         </div>
                     </div>
+                </div>
+                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700 flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <span class="text-sm font-bold text-gray-800 dark:text-zinc-200 flex items-center gap-1.5">
+                            <svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            آپدیت خودکار پـنـل
+                        </span>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer select-none">
+                        <input type="checkbox" id="auto-update-toggle" onchange="handleAutoUpdateToggle(this)" class="sr-only peer">
+                        <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-600"></div>
+                    </label>
                 </div>
                 <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
                     <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🔒 تغییر رمز عبور مدیریت</h4>
@@ -5540,14 +5648,74 @@ async function testUserSocksProxy() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.10.1';
+const CURRENT_VERSION = '1.10.3';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
+		window.autoUpdateStatusCache = false;
+		async function checkAutoUpdateSetup() {
+			try {
+				const res = await fetch('/api/auto-update-setup', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ action: 'check' })
+				});
+				const data = await res.json();
+				window.autoUpdateStatusCache = data.auto_update;
+				const toggle = document.getElementById('auto-update-toggle');
+				if (toggle) toggle.checked = data.auto_update;
+				return data;
+			} catch(e) { return null; }
+		}
+
+		async function handleAutoUpdateToggle(el) {
+			const isChecked = el.checked;
+			el.disabled = true;
+			try {
+				if (isChecked) {
+					const status = await checkAutoUpdateSetup();
+					if (status && !status.has_token) {
+						el.checked = false;
+						window.pendingCoreAction = 'enable_auto_update';
+						toggleTokenModal(true);
+					} else {
+						const res = await fetch('/api/auto-update-setup', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ action: 'enable' })
+						});
+						const data = await res.json();
+						if (res.ok && data.success) {
+							showToast('✅ آپدیت خودکار فعال شد.');
+							window.autoUpdateStatusCache = true;
+							el.checked = true;
+						} else {
+							el.checked = false;
+							alert('❌ ' + (data.error || 'خطا در فعال‌سازی'));
+						}
+					}
+				} else {
+					const res = await fetch('/api/auto-update-setup', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ action: 'disable' })
+					});
+					if (res.ok) {
+						showToast('✅ آپدیت خودکار غیرفعال شد.');
+						window.autoUpdateStatusCache = false;
+					} else {
+						el.checked = true;
+					}
+				}
+			} finally {
+				el.disabled = false;
+			}
+		}
+
 		async function checkForUpdates(isManual = false) {
             try {
                 if (isManual) {
                     document.getElementById('update-toggle').classList.add('animate-pulse');
                 }
-                const res = await fetch('https://zeus-files.surge.sh/panel-source?t=' + Date.now());
+                const res = await fetchWithFallbackUI('zeus.obfuscated.js?t=' + Date.now());
                 if (!res.ok) throw new Error('Network response was not ok');
                 const text = await res.text();
                 const match = text.match(/const\\s+CURRENT_VERSION\\s*=\\s*['"](\\d+\\.\\d+\\.\\d+)['"]/i);
@@ -5559,6 +5727,11 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
                     document.getElementById('update-toggle').className = "p-2 rounded-md bg-red-100 dark:bg-red-900/60 border border-red-500 hover:bg-red-200 dark:hover:bg-red-900/80 transition text-red-700 dark:text-red-400 shadow-[0_0_15px_rgba(239,68,68,0.6)] animate-pulse relative";
                     const badge = document.getElementById('update-badge');
                     if (badge) badge.remove();
+                    if (window.autoUpdateStatusCache && !isManual) {
+                        showToast('نسخه جدید یافت شد. در حال آپدیت خودکار...');
+                        await applyUpdate();
+                        return;
+                    }
                     if (isManual) {
                         toggleUpdateModal(true, latestVersion);
                     }
@@ -5578,13 +5751,35 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
             setModalState('token-modal', show);
             if (!show) document.getElementById('update-token-input').value = '';
         }
-        function submitTokenForUpdate() {
+        async function submitTokenForUpdate() {
             const token = document.getElementById('update-token-input').value.trim();
             if (!token) {
                 alert('لطفاً توکن را وارد کنید.');
                 return;
             }
             toggleTokenModal(false);
+            if (window.pendingCoreAction === 'enable_auto_update') {
+				try {
+					const res = await fetch('/api/auto-update-setup', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ action: 'enable', token: token })
+					});
+					const data = await res.json();
+					if (res.ok && data.success) {
+						showToast('✅ آپدیت خودکار با موفقیت فعال شد.');
+						window.autoUpdateStatusCache = true;
+						const toggle = document.getElementById('auto-update-toggle');
+						if (toggle) toggle.checked = true;
+					} else {
+						alert('❌ خطا در بررسی توکن: ' + (data.error || 'ناشناخته'));
+					}
+				} catch(e) {
+					alert('❌ خطا در ارتباط با سرور');
+				}
+				window.pendingCoreAction = null;
+				return;
+            }
             handleCoreAction(window.pendingCoreAction || 'update', token);
         }
         async function applyUpdate(token = null) {
@@ -5726,7 +5921,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 selectEl.value = String(initialRate);
             }
             window.startRefreshInterval(initialRate);
-			setTimeout(() => checkForUpdates(false), 1000);
+			checkAutoUpdateSetup().then(() => {
+				setTimeout(() => checkForUpdates(false), 1000);
+			});
             setInterval(() => {
                 if (!document.hidden) checkForUpdates(false);
             }, 300000);
